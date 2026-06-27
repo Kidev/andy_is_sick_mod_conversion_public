@@ -74,6 +74,17 @@
         };
     })(Spriteset_Base);
 
+    // Tear down any still-playing videos when the scene goes away, so a video the
+    // events never explicitly stopped can't keep decoding/uploading after its
+    // spriteset is gone (see stopAllVideos).
+    (function (Scene) {
+        var _terminate = Scene.prototype.terminate;
+        Scene.prototype.terminate = function () {
+            stopAllVideos();
+            _terminate.apply(this, arguments);
+        };
+    })(Scene_Base);
+
     // VideoPlayer
     var textureCache = {}; // PIXI.Texture keyed by video file name
     var videosById = {};   // PIXI.Sprite keyed by user-supplied id
@@ -180,26 +191,56 @@
         }
     }
 
-    // Remove a video sprite from the scene and fully release its resources.
-    function stopVideo(sprite) {
-        SceneManager._scene._spriteset.removeVideo(sprite);
+    // Cancel a sprite's frame pump and free its texture + <video>, WITHOUT touching
+    // the spriteset (so it is safe to call both on explicit stop and during scene
+    // teardown, when the spriteset is already going away). Idempotent.
+    function releaseSprite(sprite) {
+        if (sprite._videoStopped) {
+            return;
+        }
+        sprite._videoStopped = true;
         var texture = sprite.texture;
         var source = texture.baseTexture.source;
         // Stop the rVFC pump before destroying the texture, so it can't fire one
         // more time against a freed texture (loops keep presenting frames, so the
         // pump would otherwise still be scheduled).
-        sprite._videoStopped = true;
         if (sprite._rvfcHandle && source && typeof source.cancelVideoFrameCallback === "function") {
             source.cancelVideoFrameCallback(sprite._rvfcHandle);
             sprite._rvfcHandle = null;
         }
-        source.pause();
+        if (source) {
+            source.pause();
+        }
         if (sprite._videoName) {
             delete textureCache[sprite._videoName];
         }
         // destroy(true) also destroys the base texture: removes it from PIXI's
         // cache, pauses + clears the <video> src, and unhooks it from the ticker.
         texture.destroy(true);
+    }
+
+    // Remove a video sprite from the scene and fully release its resources.
+    function stopVideo(sprite) {
+        var spriteset = SceneManager._scene && SceneManager._scene._spriteset;
+        if (spriteset && sprite.parent) {
+            spriteset.removeVideo(sprite);
+        }
+        releaseSprite(sprite);
+    }
+
+    // Stop and free EVERY active video. Called on scene teardown: a looping video
+    // the events never explicitly stopped (e.g. the player left the scene mid-
+    // playback) would otherwise keep its <video> decoding and its rVFC pump
+    // uploading frames forever. That leak accumulates across scene changes and is
+    // what surfaces as progressive frame drops on lower-end machines.
+    function stopAllVideos() {
+        Object.keys(videosById).forEach(function (id) {
+            var sprite = videosById[id];
+            if (sprite) {
+                releaseSprite(sprite);
+            }
+            delete videosById[id];
+        });
     }
 
     function stopVideoById(id) {
